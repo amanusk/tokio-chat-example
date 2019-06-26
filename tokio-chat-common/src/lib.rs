@@ -2,19 +2,14 @@
 //!
 //! This crate should be straightforward; see tokio-chat-server for a description of the
 //! client/server protocol.
-#[macro_use]
-extern crate serde_derive;
 
-extern crate serde;
-extern crate serde_json;
-extern crate tokio_core;
-extern crate byteorder;
+use serde::{Deserialize, Serialize};
 
-mod codec;
+use tokio_jsoncodec::Codec as JsonCodec;
 
 // Handshake message sent from a client to a server when it first connects, identifying the
 // username of the client.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Handshake {
     pub name: String,
 }
@@ -25,9 +20,9 @@ impl Handshake {
     }
 }
 
-pub type HandshakeCodec = codec::LengthPrefixedJson<Handshake, Handshake>;
+pub type HandshakeCodec = JsonCodec<Handshake, Handshake>;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientMessage(pub String);
 
 impl ClientMessage {
@@ -37,7 +32,7 @@ impl ClientMessage {
 }
 
 // Enumerate possible messages the server can send to clients.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
     // A message from a client (first String) containing arbitrary content (second String).
     Message(String, String),
@@ -51,5 +46,5 @@ pub enum ServerMessage {
     UserDisconnected(String),
 }
 
-pub type ServerToClientCodec = codec::LengthPrefixedJson<ClientMessage, ServerMessage>;
-pub type ClientToServerCodec = codec::LengthPrefixedJson<ServerMessage, ClientMessage>;
+pub type ServerToClientCodec = JsonCodec<ClientMessage, ServerMessage>;
+pub type ClientToServerCodec = JsonCodec<ServerMessage, ClientMessage>;

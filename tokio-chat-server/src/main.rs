@@ -20,22 +20,18 @@
 //! in this project and then in another window run one or more instances the tokio-chat-client
 //! binary.
 
-extern crate futures;
-extern crate tokio_core;
-extern crate tokio_chat_common;
-
+use futures::stream;
+use futures::sync::mpsc;
+use futures::{Future, Sink, Stream};
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use tokio_core::io::Io;
-use tokio_core::reactor::Core;
+use std::rc::Rc;
+use tokio_chat_common::{ClientMessage, HandshakeCodec, ServerMessage, ServerToClientCodec};
+use tokio_codec::Framed;
 use tokio_core::net::TcpListener;
-use futures::{Stream, Sink, Future};
-use futures::stream;
-use futures::sync::mpsc;
-use tokio_chat_common::{HandshakeCodec, ClientMessage, ServerMessage, ServerToClientCodec};
+use tokio_core::reactor::Core;
 
 // For each client that connects, we hang on to an mpsc::Sender (to send the task managing
 // that client messages) and the name they gave us during handshaking.
@@ -83,12 +79,17 @@ impl ConnectedClients {
     // easier to insert calls to this method in other contexts. This method itself will never
     // fail. Perhaps the return type could change to `Box<Future<Item = (), Error = !>>` once
     // `!` lands?
-    fn broadcast<E: 'static>(&self, message: ServerMessage) -> Box<Future<Item = (), Error = E>> {
+    fn broadcast<E: 'static>(
+        &self,
+        message: ServerMessage,
+    ) -> Box<dyn Future<Item = (), Error = E>> {
         let client_map = self.0.borrow();
 
         // For each client, clone its `mpsc::Sender` (because sending consumes the sender) and
         // start sending a clone of `message`. This produces an iterator of Futures.
-        let all_sends = client_map.values().map(|client| client.tx.clone().send(message.clone()));
+        let all_sends = client_map
+            .values()
+            .map(|client| client.tx.clone().send(message.clone()));
 
         // Collect the futures into a stream. We don't care about:
         //
@@ -130,13 +131,14 @@ fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
+    println!("Listening on: {}", addr);
 
     // Create our (currently empty) stash of clients.
     let clients = ConnectedClients::new();
 
     let server = listener.incoming().for_each(move |(socket, addr)| {
         // Frame the socket in a codec that will give us a `Handshake`.
-        let handshake_io = socket.framed(HandshakeCodec::new());
+        let handshake_io = Framed::new(socket, HandshakeCodec::new(false));
 
         // `handshake_io` is a stream, but we just want to read a single `Handshake` off of it
         // then convert the socket into a different kind of stream. `.into_future()` lets us
@@ -144,19 +146,22 @@ fn main() {
         // `handshake_io` itself.
         //
         // If an error occurs, we just want the error and can discard the stream.
-        let handshake = handshake_io.into_future()
-            .map_err(|(err, _)| err)
+        let handshake = handshake_io
+            .into_future()
+            .map_err(|(err, _)| err.into())
             .and_then(move |(h, io)| {
                 // `h` here is an `Option<Handshake>`. If we did not get a `Handshake`, throw
                 // an error. This can happen if a client connects then disconnects, for example.
                 // If we did get a handshake, log the client's name and return both the handshake
                 // and the unframed socket. (`io.into_inner()` removes the framing and gives back
                 // the underlying `Io` handle, which is `socket` in this case.
-                h.map_or_else(|| Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-                              move |h| {
-                                  println!("CONNECTED from {:?} with name {}", addr, h.name);
-                                  Ok((h, io.into_inner()))
-                              })
+                h.map_or_else(
+                    || Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                    move |h| {
+                        println!("CONNECTED from {:?} with name {}", addr, h.name);
+                        Ok((h, io.into_inner()))
+                    },
+                )
             });
 
         // If the handshake succeeds, the next step is to broadcast the `UserConnected` message.
@@ -172,8 +177,10 @@ fn main() {
 
             // Broadcast the message, and send this client's name, `mpsc::Receiver`, and socket
             // as the `Item` of this future.
-            clients.broadcast(ServerMessage::UserConnected(name.clone()))
+            clients
+                .broadcast(ServerMessage::UserConnected(name.clone()))
                 .map(|()| (name, rx, socket))
+            //.map_err(|err| err.into())
         });
 
         // After broadcasting the announcment, the next step is to set up the futures that
@@ -182,7 +189,8 @@ fn main() {
         let connection = announce_connect.and_then(|(name, rx, socket)| {
             // Frame the socket in a codec that lets us receive `ClientMessage`s and send
             // `ServerMessage`s.
-            let (to_client, from_client) = socket.framed(ServerToClientCodec::new()).split();
+            let (to_client, from_client) =
+                Framed::new(socket, ServerToClientCodec::new(false)).split();
 
             // For each incoming `ClientMessage`, attach the sending client's `name` and
             // broadcast the resulting `ServerMessage::Message` to all connected clients.
@@ -196,23 +204,22 @@ fn main() {
             // `Item` type of that future.
             let writer = rx
                 .map_err(|()| unreachable!("rx can't fail"))
-
                 // `fold` seems to be the most straightforward way to handle this. It takes
                 // an initial value of `to_client` (the sending half of the framed socket);
                 // for each message, it tries to send the message, and the future returned
                 // by `to_client.send` gives back `to_client` itself on success, ready for the
                 // next step of the fold.
-                .fold(to_client, |to_client, msg| {
-                    to_client.send(msg)
-                })
-
+                .fold(to_client, |to_client, msg| to_client.send(msg))
                 // Once the rx stream is exhausted (because the sender has been dropped), we
                 // no longer need the writing half of the socket, so discard it.
                 .map(|_| ());
 
             // Use select to allow either the reading or writing half dropping to drop the other
             // half. The `map` and `map_err` here effectively force this drop.
-            reader.select(writer).map(|_| ()).map_err(|(err, _)| err)
+            reader
+                .select(writer)
+                .map(|_| ())
+                .map_err(|(err, _)| err.into())
         });
 
         // Finally, spawn off the connection.
@@ -234,9 +241,11 @@ fn main() {
             // but we can sidestep this by taking advantage of the fact that `Option` can also
             // act as an `Iterator` over its single (or no) element, convert that to a `Stream`
             // via `stream::iter`, then `fold` over the 0-or-1 long stream to send the message.
-            let msg = clients_inner.remove(&addr)
+            let msg = clients_inner
+                .remove(&addr)
                 .map(|client| ServerMessage::UserDisconnected(client.name));
-            stream::iter(msg.map(|m| Ok(m))).fold((), move |(), m| clients_inner.broadcast(m))
+            stream::iter_result(msg.map(|m| Ok(m)))
+                .fold((), move |(), m| clients_inner.broadcast(m))
         }));
 
         Ok(())

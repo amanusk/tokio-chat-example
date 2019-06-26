@@ -8,8 +8,7 @@
 //! with the message `* your_chat_username connected`, and you should be able to type messages.
 //! Start up another instance of this client (probably with a different username) in another
 //! window to confirm messages are being broadcast to all clients.
-//!
-//! The 10,000-foot view archiecture of this client is that a thread is spawned to run a tokio
+//!  The 10,000-foot view archiecture of this client is that a thread is spawned to run a tokio
 //! reactor with the client connection to the server, that thread is given a
 //! `std::sync::mpsc::Sender` it can use to send messages back to the GUI thread, and the GUI
 //! thread is given a `futures::mpsc::sync::Sender` to send the user's chat messages to the tokio
@@ -17,28 +16,24 @@
 //!
 //! Note that the GUI code below is mostly unannotated except where it comes into contact with
 //! tokio-like things.
-extern crate futures;
-extern crate tokio_core;
-extern crate cursive;
-extern crate unicode_width;
-extern crate tokio_chat_common;
 
-use cursive::Cursive;
 use cursive::direction::Direction;
 use cursive::event::{Event, Key};
 use cursive::theme::Theme;
 use cursive::traits::{Boxable, Identifiable, View};
 use cursive::views::{EditView, LinearLayout};
+use cursive::Cursive;
 use std::thread;
 
-use std::net::SocketAddr;
-use tokio_core::io::Io;
-use tokio_core::reactor::Core;
-use tokio_core::net::TcpStream;
-use futures::{Stream, Sink, Future};
 use futures::sync::mpsc;
-use tokio_chat_common::{Handshake, HandshakeCodec, ClientMessage, ServerMessage,
-                        ClientToServerCodec};
+use futures::{Future, Sink, Stream};
+use std::net::SocketAddr;
+use tokio_chat_common::{
+    ClientMessage, ClientToServerCodec, Handshake, HandshakeCodec, ServerMessage,
+};
+use tokio_codec::Framed;
+use tokio_core::net::TcpStream;
+use tokio_core::reactor::Core;
 
 mod chat_view;
 use self::chat_view::ChatView;
@@ -47,11 +42,12 @@ use self::chat_view::ChatView;
 // _not_ a `futures::sync::mpsc::Sender`!). This allows us to send closures to be run in the
 // Cursive GUI context.
 #[derive(Clone)]
-struct GuiEventSender(std::sync::mpsc::Sender<Box<Fn(&mut Cursive) + Send>>);
+struct GuiEventSender(std::sync::mpsc::Sender<Box<dyn Fn(&mut Cursive) + Send>>);
 
 impl GuiEventSender {
     fn send<F>(&self, f: F)
-        where F: Fn(&mut GuiWrapper) + Send + 'static
+    where
+        F: Fn(&mut GuiWrapper) + Send + 'static,
     {
         self.0
             .send(Box::new(move |cursive| f(&mut GuiWrapper::new(cursive))))
@@ -69,18 +65,27 @@ impl<'a> GuiWrapper<'a> {
     // Build up the Cursive UI. `tx` is a `futures::sync::mpsc::Sender` that we use to send
     // client input to the thread managing the tokio connection to the server.
     fn build_ui(&mut self, tx: mpsc::Sender<ClientMessage>) -> GuiEventSender {
-        self.0.add_layer(LinearLayout::vertical()
-            .child(ChatView::new(500)
-                .with_id("chat")
-                .full_height())
-            .child(EditView::new()
-                .on_submit(move |cursive, s| {
-                    // This is called whenever the user presses "enter" after entering text.
-                    GuiWrapper::new(cursive).handle_entry_input(s, tx.clone());
-                })
-                .with_id("input")
-                .full_width()));
-        for k in &[Key::Home, Key::End, Key::Up, Key::Down, Key::PageDown, Key::PageUp] {
+        self.0.add_layer(
+            LinearLayout::vertical()
+                .child(ChatView::new(500).with_id("chat").full_height())
+                .child(
+                    EditView::new()
+                        .on_submit(move |cursive, s| {
+                            // This is called whenever the user presses "enter" after entering text.
+                            GuiWrapper::new(cursive).handle_entry_input(s, tx.clone());
+                        })
+                        .with_id("input")
+                        .full_width(),
+                ),
+        );
+        for k in &[
+            Key::Home,
+            Key::End,
+            Key::Up,
+            Key::Down,
+            Key::PageDown,
+            Key::PageUp,
+        ] {
             let e = Event::Key(*k);
             self.0.add_global_callback(e, move |s| {
                 {
@@ -88,7 +93,9 @@ impl<'a> GuiWrapper<'a> {
                     chat.on_event(e);
                 }
 
-                s.find_id::<EditView>("input").unwrap().take_focus(Direction::front());
+                s.find_id::<EditView>("input")
+                    .unwrap()
+                    .take_focus(Direction::front());
             });
         }
         self.0.set_fps(10);
@@ -165,20 +172,25 @@ fn run_client(name: String, gui: GuiEventSender, rx: mpsc::Receiver<ClientMessag
     // Create the event loop and initiate the connection to the remote server
     let mut core = Core::new().unwrap();
     let handle = core.handle();
-    let tcp = TcpStream::connect(&addr, &handle);
+    let tcp = TcpStream::connect(&addr, &handle).map_err(|err| err.into());
 
     // Once we connect, send a `Handshake` with our name.
     let handshake = tcp.and_then(|stream| {
-        let handshake_io = stream.framed(HandshakeCodec::new());
+        let handshake_io = Framed::new(stream, HandshakeCodec::new(false));
 
         // After sending the handshake, convert the framed stream back into its inner socket.
-        handshake_io.send(Handshake::new(name)).map(|handshake_io| handshake_io.into_inner())
+        handshake_io
+            .send(Handshake::new(name.clone()))
+            .map(|handshake_io| {
+                println!("Sending {}", name.clone());
+                handshake_io.into_inner()
+            })
     });
 
     // Once we've sent our `Handshake`, start listening for messages from either the server (to
     // send to the GUI thread) or the GUI thread (to send to the server).
     let client = handshake.and_then(|socket| {
-        let (to_server, from_server) = socket.framed(ClientToServerCodec::new()).split();
+        let (to_server, from_server) = Framed::new(socket, ClientToServerCodec::new(false)).split();
 
         // For each incoming message...
         let reader = from_server.for_each(move |msg| {
@@ -200,9 +212,7 @@ fn run_client(name: String, gui: GuiEventSender, rx: mpsc::Receiver<ClientMessag
         // being fed from the GUI thread instead of from other futures.
         let writer = rx
             .map_err(|()| unreachable!("rx can't fail"))
-            .fold(to_server, |to_server, msg| {
-                to_server.send(msg)
-            })
+            .fold(to_server, |to_server, msg| to_server.send(msg))
             .map(|_| ());
 
         // Use select to allow either the reading or writing half dropping to drop the other
